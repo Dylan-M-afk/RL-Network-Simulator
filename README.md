@@ -107,6 +107,6 @@ Node Usage
 ![Node Usage](https://i.imgur.com/yAtp7Go.png)
 ## Authors
 
-- [@Dylan-M-afk](https://github.com/Dylan-M-afk)
-- [@UnusualFrog](https://github.com/UnusualFrog)
-- [@Parker-Wallace](https://github.com/Parker-Wallace)
+- [Dylan Mercer](https://github.com/Dylan-M-afk)
+- [Julia Forward](https://github.com/UnusualFrog)
+- [Parker-Wallace](https://github.com/Parker-Wallace)
