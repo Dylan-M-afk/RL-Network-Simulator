@@ -17,3 +17,6 @@ shared/routing_decision.json
 /project/shared/routing_decision.json
 project/shared/routing_decision.json
 project/module_b/qtable.pkl
+
+/project/module_a/network_parameters.yaml
+project/module_a/network_parameters.yaml
