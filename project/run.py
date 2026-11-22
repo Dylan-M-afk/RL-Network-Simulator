@@ -1,4 +1,5 @@
 # ========== Launcher ==========
+
 # Interactive launcher for the RL Network Simulation project.
 # Handles starting the simulator, RL agent, and evaluation report
 # as coordinated subprocesses from a single terminal.
@@ -11,6 +12,10 @@ import sys
 import time
 import signal
 import subprocess
+import threading
+import queue
+import re
+
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -66,7 +71,7 @@ def prompt_tick_speed(with_rl):
     if with_rl:
         print(f"  Minimum with RL    : {floor}s  (agent needs time to read/write files)")
     else:
-        print( "  Set to 0 for maximum speed (useful for generating baseline history quickly)")
+        print("  Set to 0 for maximum speed (useful for generating baseline history quickly)")
     print()
 
     raw = input(f"  Enter tick interval in seconds [Enter to keep {current}s]: ").strip()
@@ -144,7 +149,7 @@ def run_subprocess(cmd, cwd, extra_env=None):
         env.update(extra_env)
     return subprocess.Popen(cmd, cwd=cwd, env=env)
 
-def wait_for_procs(procs: list[subprocess.Popen], labels: list[str]):
+def wait_for_procs(procs, labels):
     """
     Block until all processes finish or the user hits Ctrl+C.
     On Ctrl+C, sends SIGTERM (Windows: terminate) to each process gracefully.
@@ -181,6 +186,133 @@ def wait_for_procs(procs: list[subprocess.Popen], labels: list[str]):
                 p.kill()
 
     print("  All processes stopped.")
+
+def run_ordered_subprocess(cmd, cwd, label, output_queue, extra_env=None):
+    """Run a subprocess and forward its output to the ordered-output queue."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if extra_env:
+        env.update(extra_env)
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    def read_output():
+        try:
+            for line in proc.stdout:
+                output_queue.put((label, line))
+        finally:
+            proc.stdout.close()
+            output_queue.put((label, None))
+
+    threading.Thread(target=read_output, daemon=True).start()
+    return proc
+
+
+def wait_for_procs_ordered(procs, labels, output_queue, evaluate=False,
+                           show_header=True, stop_text="Stopping processes...",
+                           done_text="All processes stopped."):
+    """Display simulator and RL tick lines in simulation-tick order."""
+    if show_header:
+        print()
+        sep()
+        running_labels = ", ".join(labels)
+        print(f"  Running: {running_labels}")
+        print("  Press Ctrl+C to stop.")
+        sep()
+
+    tick_buffers = {"Simulator": {}, "RL Agent": {}}
+    next_tick = 0
+    finished_readers = set()
+    last_eval = time.time()
+    tick_pattern = re.compile(r"^\s*Tick\s+(\d+)\s*\|")
+
+    def display_ready_ticks(force=False):
+        nonlocal next_tick
+
+        # Hold each process's tick lines until both have reported the same
+        # tick number, then print the simulator line followed by the RL line.
+        while all(next_tick in tick_buffers[label] for label in labels):
+            print(tick_buffers["Simulator"].pop(next_tick), end="", flush=True)
+            print(tick_buffers["RL Agent"].pop(next_tick), end="", flush=True)
+            next_tick += 1
+
+        if force:
+            remaining_ticks = sorted(
+                tick for per_process in tick_buffers.values()
+                for tick in per_process
+            )
+            for tick in remaining_ticks:
+                for label in labels:
+                    line = tick_buffers[label].pop(tick, None)
+                    if line is not None:
+                        print(line, end="", flush=True)
+
+    def handle_output(label, line):
+        if line is None:
+            finished_readers.add(label)
+            return
+
+        tick_match = tick_pattern.match(line)
+        if tick_match and label in tick_buffers:
+            tick_buffers[label][int(tick_match.group(1))] = line
+        else:
+            print(line, end="", flush=True)
+
+        display_ready_ticks()
+
+    try:
+        while len(finished_readers) < len(procs):
+            try:
+                label, line = output_queue.get(timeout=0.1)
+                handle_output(label, line)
+            except queue.Empty:
+                pass
+
+            if evaluate and time.time() - last_eval >= 30:
+                print("\n  [Auto-evaluate]")
+                eval_proc = run_subprocess([PYTHON, EVALUATOR], cwd=MODULE_B_DIR)
+                eval_proc.wait()
+                last_eval = time.time()
+
+        display_ready_ticks(force=True)
+
+    except KeyboardInterrupt:
+        print(f"\n  {stop_text}")
+        for proc in procs:
+            if proc.poll() is None:
+                if os.name == "nt":
+                    proc.terminate()
+                else:
+                    proc.send_signal(signal.SIGTERM)
+
+        # Give them up to 5 seconds to shut down cleanly
+        deadline = time.time() + 5
+        for proc in procs:
+            remaining = max(0, deadline - time.time())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        # Continue reading until both subprocess output streams have closed.
+        while len(finished_readers) < len(procs):
+            try:
+                label, line = output_queue.get(timeout=0.1)
+                handle_output(label, line)
+            except queue.Empty:
+                pass
+
+        display_ready_ticks(force=True)
+
+    print(f"  {done_text}")
 
 # ─── Menu options ─────────────────────────────────────────────────────────────
 
@@ -226,7 +358,10 @@ def option_simulator_and_rl():
     tick_speed = read_current_tick_speed()
     sep()
 
-    sim   = run_subprocess([PYTHON, SIMULATOR], cwd=MODULE_A_DIR)
+    output_queue = queue.Queue()
+    sim = run_ordered_subprocess(
+        [PYTHON, SIMULATOR], MODULE_A_DIR, "Simulator", output_queue
+    )
 
     # Small delay so the simulator writes its first state.json before the agent starts
     print()
@@ -234,9 +369,11 @@ def option_simulator_and_rl():
     time.sleep(3)
 
     # Pass tick interval to agent via env so it stays in sync with the simulator
-    agent = run_subprocess([PYTHON, RL_AGENT], cwd=MODULE_B_DIR,
-                           extra_env={"RL_TICK_INTERVAL": str(tick_speed)})
-    wait_for_procs([sim, agent], ["Simulator", "RL Agent"])
+    agent = run_ordered_subprocess(
+        [PYTHON, RL_AGENT], MODULE_B_DIR, "RL Agent", output_queue,
+        extra_env={"RL_TICK_INTERVAL": str(tick_speed)}
+    )
+    wait_for_procs_ordered([sim, agent], ["Simulator", "RL Agent"], output_queue)
     wait_for_key()
 
 def option_train_only():
@@ -321,11 +458,16 @@ def option_simulator_rl_and_evaluate():
     tick_speed = read_current_tick_speed()
     sep()
 
-    sim = run_subprocess([PYTHON, SIMULATOR], cwd=MODULE_A_DIR)
+    output_queue = queue.Queue()
+    sim = run_ordered_subprocess(
+        [PYTHON, SIMULATOR], MODULE_A_DIR, "Simulator", output_queue
+    )
     print("  Waiting 3 seconds for simulator to initialise...")
     time.sleep(3)
-    agent = run_subprocess([PYTHON, RL_AGENT], cwd=MODULE_B_DIR,
-                           extra_env={"RL_TICK_INTERVAL": str(tick_speed)})
+    agent = run_ordered_subprocess(
+        [PYTHON, RL_AGENT], MODULE_B_DIR, "RL Agent", output_queue,
+        extra_env={"RL_TICK_INTERVAL": str(tick_speed)}
+    )
 
     print()
     print("  Running: Simulator + RL Agent")
@@ -333,29 +475,11 @@ def option_simulator_rl_and_evaluate():
     print("  Press Ctrl+C to stop everything.")
     sep()
 
-    try:
-        last_eval = time.time()
-        while True:
-            all_done = all(p.poll() is not None for p in [sim, agent])
-            if all_done:
-                break
-            if time.time() - last_eval >= 30:
-                print("\n  [Auto-evaluate]")
-                eval_proc = run_subprocess([PYTHON, EVALUATOR], cwd=MODULE_B_DIR)
-                eval_proc.wait()
-                last_eval = time.time()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n  Stopping all processes...")
-        for p in [sim, agent]:
-            if p.poll() is None:
-                p.terminate() if os.name != "nt" else p.kill()
-        time.sleep(2)
-        for p in [sim, agent]:
-            if p.poll() is None:
-                p.kill()
-
-    print("  All stopped.")
+    wait_for_procs_ordered(
+        [sim, agent], ["Simulator", "RL Agent"], output_queue,
+        evaluate=True, show_header=False,
+        stop_text="Stopping all processes...", done_text="All stopped."
+    )
     wait_for_key()
 
 
